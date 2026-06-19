@@ -2,7 +2,8 @@ CREATE TABLE IF NOT EXISTS devices (
     id TEXT PRIMARY KEY,
     platform TEXT NOT NULL,
     last_heartbeat INTEGER NOT NULL,
-   protection_active INTEGER NOT NULL DEFAULT 1,
+    token_hash TEXT NOT NULL,
+    protection_active INTEGER NOT NULL DEFAULT 1,
     alerted INTEGER NOT NULL DEFAULT 0,
     created INTEGER NOT NULL
 );

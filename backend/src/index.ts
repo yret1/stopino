@@ -5,16 +5,30 @@ const STALE_MS = 15 * 60 * 1000;
 
 const app = new Hono<{ Bindings: Env }>();
 
+async function sha256(input: string): Promise<string> {
+	const data = new TextEncoder().encode(input);
+	const digest = await crypto.subtle.digest('SHA-256', data);
+	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 app.post('/heartbeat', async (c) => {
-	const { device_id, protection_active } = await c.req.json();
-	if (!device_id) return c.json({ error: 'device_id required' }, 400);
+	const { device_id, token, protection_active } = await c.req.json();
+	if (!device_id || !token) {
+		return c.json({ error: 'device_id and token required' }, 400);
+	}
+
+	const row = await c.env.stopino_db.prepare(`SELECT token_hash FROM devices WHERE id = ?`).bind(device_id).first<{ token_hash: string }>();
+
+	if (!row || row.token_hash !== (await sha256(token))) {
+		return c.json({ error: 'unauthorized' }, 401);
+	}
 
 	const now = Date.now();
 	await c.env.stopino_db
 		.prepare(
 			`UPDATE devices
-       SET last_heartbeat = ?, protection_active = ?, alerted = 0
-     WHERE id = ?`
+         SET last_heartbeat = ?, protection_active = ?, alerted = 0
+       WHERE id = ?`
 		)
 		.bind(now, protection_active ? 1 : 0, device_id)
 		.run();
@@ -22,30 +36,34 @@ app.post('/heartbeat', async (c) => {
 	return c.json({ ok: true, at: now });
 });
 
-app.post('/enroll', async (c) => {
-	const { device_id, platform, buddy_contact } = await c.req.json();
+app.post('/enroll', async (context) => {
+	const { device_id, platform, buddy_contact } = await context.req.json();
 	if (!device_id || !platform) {
-		return c.json({ error: 'device_id and platform required' }, 400);
+		return context.json({ error: 'device_id and platform required' }, 400);
 	}
 	const now = Date.now();
 
-	await c.env.stopino_db
+	//Device identifier
+	const token = crypto.randomUUID() + crypto.randomUUID();
+	const token_hash = await sha256(token);
+
+	await context.env.stopino_db
 		.prepare(
-			`INSERT INTO devices (id, platform, last_heartbeat, created)
-   VALUES (?, ?, ?, ?)
-   ON CONFLICT(id) DO UPDATE SET platform = excluded.platform`
+			`INSERT INTO devices (id, platform, token_hash, last_heartbeat, created)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET platform = excluded.platform`
 		)
-		.bind(device_id, platform, now, now)
+		.bind(device_id, platform, token_hash, now, now)
 		.run();
 
 	if (buddy_contact) {
-		await c.env.stopino_db
+		await context.env.stopino_db
 			.prepare(`INSERT INTO buddies (id, device_id, contact) VALUES (?, ?, ?)`)
 			.bind(crypto.randomUUID(), device_id, buddy_contact)
 			.run();
 	}
 
-	return c.json({ ok: true });
+	return context.json({ ok: true, token });
 });
 export default {
 	fetch: app.fetch,
@@ -97,6 +115,7 @@ export default {
 			}
 
 			// Only mark handled if every buddy was notified successfully
+			// Retry if failed? Nah
 			if (allSent) {
 				await env.stopino_db.prepare(`UPDATE devices SET alerted = 1 WHERE id = ?`).bind(device.id).run();
 			}
