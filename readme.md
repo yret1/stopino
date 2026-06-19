@@ -1,0 +1,1 @@
+##Stopino - The free to use fully opensource gambilng addiction helper
