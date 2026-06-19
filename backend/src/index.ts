@@ -1,40 +1,105 @@
-/**
- * Welcome to Cloudflare Workers!
- *
- * This is a template for a Scheduled Worker: a Worker that can run on a
- * configurable interval:
- * https://developers.cloudflare.com/workers/platform/triggers/cron-triggers/
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Run `curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"` to see your Worker in action
- * - Run `npm run deploy` to publish your Worker
- *
- * Bind resources to your Worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import { Hono } from 'hono';
 
+type Env = { stopino_db: D1Database; RESEND_API_KEY: string };
+const STALE_MS = 15 * 60 * 1000;
+
+const app = new Hono<{ Bindings: Env }>();
+
+app.post('/heartbeat', async (c) => {
+	const { device_id, protection_active } = await c.req.json();
+	if (!device_id) return c.json({ error: 'device_id required' }, 400);
+
+	const now = Date.now();
+	await c.env.stopino_db
+		.prepare(
+			`UPDATE devices
+       SET last_heartbeat = ?, protection_active = ?, alerted = 0
+     WHERE id = ?`
+		)
+		.bind(now, protection_active ? 1 : 0, device_id)
+		.run();
+
+	return c.json({ ok: true, at: now });
+});
+
+app.post('/enroll', async (c) => {
+	const { device_id, platform, buddy_contact } = await c.req.json();
+	if (!device_id || !platform) {
+		return c.json({ error: 'device_id and platform required' }, 400);
+	}
+	const now = Date.now();
+
+	await c.env.stopino_db
+		.prepare(
+			`INSERT INTO devices (id, platform, last_heartbeat, created)
+   VALUES (?, ?, ?, ?)
+   ON CONFLICT(id) DO UPDATE SET platform = excluded.platform`
+		)
+		.bind(device_id, platform, now, now)
+		.run();
+
+	if (buddy_contact) {
+		await c.env.stopino_db
+			.prepare(`INSERT INTO buddies (id, device_id, contact) VALUES (?, ?, ?)`)
+			.bind(crypto.randomUUID(), device_id, buddy_contact)
+			.run();
+	}
+
+	return c.json({ ok: true });
+});
 export default {
-	async fetch(req) {
-		const url = new URL(req.url);
-		url.pathname = '/__scheduled';
-		url.searchParams.append('cron', '* * * * *');
-		return new Response(`To test the scheduled handler, ensure you have used the "--test-scheduled" then try running "curl ${url.href}".`);
-	},
+	fetch: app.fetch,
 
-	// The scheduled handler is invoked at the interval set in our wrangler.jsonc's
-	// [[triggers]] configuration.
-	async scheduled(event, env, ctx): Promise<void> {
-		// A Cron Trigger can make requests to other endpoints on the Internet,
-		// publish to a Queue, query a D1 Database, and much more.
-		//
-		// We'll keep it simple and make an API call to a Cloudflare API:
-		let resp = await fetch('https://api.cloudflare.com/client/v4/ips');
-		let wasSuccessful = resp.ok ? 'success' : 'fail';
+	async scheduled(_event: ScheduledEvent, env: Env) {
+		const cutoff = Date.now() - STALE_MS;
 
-		// You could store this result in KV, write to a D1 Database, or publish to a Queue.
-		// In this template, we'll just log the result:
-		console.log(`trigger fired at ${event.cron}: ${wasSuccessful}`);
+		const stale = await env.stopino_db
+			.prepare(`SELECT id FROM devices WHERE last_heartbeat < ? AND alerted = 0`)
+			.bind(cutoff)
+			.all<{ id: string }>();
+
+		for (const device of stale.results) {
+			const buddies = await env.stopino_db
+				.prepare(`SELECT contact FROM buddies WHERE device_id = ?`)
+				.bind(device.id)
+				.all<{ contact: string }>();
+
+			let allSent = true;
+
+			for (const b of buddies.results) {
+				try {
+					const res = await fetch('https://api.resend.com/emails', {
+						method: 'POST',
+						headers: {
+							Authorization: `Bearer ${env.RESEND_API_KEY}`,
+							'Content-Type': 'application/json',
+						},
+						body: JSON.stringify({
+							from: 'onboarding@resend.dev',
+							to: b.contact,
+							subject: 'A device you support has stopped checking in',
+							text:
+								`The protection on a device you're supporting stopped reporting in.\n\n` +
+								`This can happen if the app was turned off, removed, or the device ` +
+								`has been offline for a while. It might be a good moment to check in ` +
+								`with them.\n\n— Stopino`,
+						}),
+					});
+
+					if (!res.ok) {
+						allSent = false;
+						console.error(`Resend failed for ${b.contact}: ${res.status}`);
+					}
+				} catch (err) {
+					allSent = false;
+					console.error(`Resend threw for ${b.contact}:`, err);
+				}
+			}
+
+			// Only mark handled if every buddy was notified successfully
+			if (allSent) {
+				await env.stopino_db.prepare(`UPDATE devices SET alerted = 1 WHERE id = ?`).bind(device.id).run();
+			}
+		}
 	},
-} satisfies ExportedHandler<Env>;
+};
